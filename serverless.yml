@@ -1,0 +1,85 @@
+service: loan-eligibility-engine
+frameworkVersion: '3'
+useDotenv: true
+
+plugins:
+  - serverless-python-requirements
+  - serverless-localstack
+
+provider:
+  name: aws
+  runtime: python3.11
+  region: us-east-1
+  stage: ${opt:stage, 'local'}
+  memorySize: 256
+  timeout: 30
+  environment:
+    UPLOAD_BUCKET: ${self:custom.bucketName}
+    DB_HOST: ${env:DB_HOST, 'postgres'}
+    DB_PORT: ${env:DB_PORT, '5432'}
+    DB_NAME: ${env:POSTGRES_DB, 'loan_engine'}
+    DB_USER: ${env:POSTGRES_USER, 'loan_admin'}
+    DB_PASSWORD: ${env:POSTGRES_PASSWORD, 'loan_pass_change_me'}
+    N8N_MATCH_WEBHOOK_URL: ${env:N8N_MATCH_WEBHOOK_URL, 'http://n8n:5678/webhook/match-users'}
+    WEBHOOK_SECRET: ${env:WEBHOOK_SECRET, 'change-me'}
+    # Browser-facing S3 endpoint (used to build presigned POST URLs)
+    S3_ENDPOINT_PUBLIC: ${env:S3_ENDPOINT_PUBLIC, 'http://localhost:4566'}
+    # Lambda-container-facing S3 endpoint (used to read the uploaded CSV)
+    S3_ENDPOINT_INTERNAL: ${env:S3_ENDPOINT_INTERNAL, 'http://localstack:4566'}
+  s3:
+    uploads:
+      name: ${self:custom.bucketName}
+      corsConfiguration:
+        CorsRules:
+          - AllowedOrigins: ['*']
+            AllowedMethods: [GET, PUT, POST, HEAD]
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag]
+
+custom:
+  bucketName: loan-uploads-${self:provider.stage}
+  pythonRequirements:
+    dockerizePip: false        # pg8000 is pure Python, no native build needed
+    pythonBin: python
+  localstack:
+    stages: [local]
+    host: http://localhost
+    edgePort: 4566
+    autostart: false
+
+package:
+  patterns:
+    - '!**'
+    - 'src/**'
+
+functions:
+  # 1. UI asks for a presigned S3 POST so the CSV goes straight to S3 (no Lambda payload/time limits).
+  getUploadUrl:
+    handler: src/handlers/get_upload_url.handler
+    events:
+      - http:
+          path: upload-url
+          method: post
+          cors: true
+
+  # 2. UI polls pipeline progress.
+  getBatchStatus:
+    handler: src/handlers/get_batch_status.handler
+    events:
+      - http:
+          path: batches/{batchId}
+          method: get
+          cors: true
+
+  # 3. S3 ObjectCreated event -> stream-parse CSV -> bulk upsert into Postgres -> call n8n webhook.
+  processCsv:
+    handler: src/handlers/process_csv.handler
+    timeout: 300
+    memorySize: 512
+    events:
+      - s3:
+          bucket: uploads
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: uploads/
+            - suffix: .csv

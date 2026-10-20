@@ -1,0 +1,468 @@
+{
+  "name": "B - User-Loan Matching",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "match-users",
+        "options": {}
+      },
+      "id": "16bfb148-2be5-48ed-8934-c7a3c909e6bd",
+      "name": "Webhook: New Batch",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        432
+      ],
+      "webhookId": "1cf33dc0-a7d0-42b4-b59e-05085ee95b0d"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Security + validation gate: only the Lambda / workflow B (which hold WEBHOOK_SECRET) may trigger this workflow.\nconst secret = $env.WEBHOOK_SECRET;\nconst first = $input.first().json;\nconst got = (first.headers || {})['x-webhook-secret'];\nif (secret && got !== secret) throw new Error('Invalid webhook secret');\nconst batchId = (first.body || {}).batch_id || '';\nif (!/^[0-9a-f-]{36}$/i.test(batchId)) throw new Error('Invalid batch_id');\nreturn [{ json: { batch_id: batchId } }];"
+      },
+      "id": "8730081a-abd4-4386-b701-34cc88121736",
+      "name": "Verify Secret",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE upload_batches SET status = 'matching' WHERE batch_id = $1::uuid RETURNING batch_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Verify Secret').first().json.batch_id ] }}"
+        }
+      },
+      "id": "fd9a65ff-bcdc-4b04-811f-bfa227b35f30",
+      "name": "Set Status: matching",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        448,
+        432
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "9jgYKd07RKNCxXpS",
+          "name": "Local Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- STAGE 1: set-based SQL pre-filter. One statement evaluates every (new user x active product) pair inside Postgres.\n-- Hard filters (age, employment, max score) are applied first; income/score allow a small tolerance band so that\n-- \"near misses\" can be judged later. Exact matches are approved immediately, near misses are queued for the LLM.\nWITH pairs AS (\n  SELECT u.user_id, p.product_id,\n         (u.monthly_income >= p.min_monthly_income AND u.credit_score >= p.min_credit_score) AS exact_ok\n  FROM users u\n  JOIN loan_products p\n    ON p.is_active\n   AND u.age BETWEEN COALESCE(p.min_age, 18) AND COALESCE(p.max_age, 100)\n   AND (p.allowed_employment IS NULL OR u.employment_status = ANY(p.allowed_employment))\n   AND (p.max_credit_score IS NULL OR u.credit_score <= p.max_credit_score)\n  WHERE u.upload_batch_id = $1::uuid\n    AND u.monthly_income >= p.min_monthly_income * 0.90\n    AND u.credit_score  >= p.min_credit_score - 20\n), ins AS (\n  INSERT INTO matches (user_id, product_id, batch_id, status, stage)\n  SELECT user_id, product_id, $1::uuid,\n         CASE WHEN exact_ok THEN 'approved' ELSE 'review' END,\n         CASE WHEN exact_ok THEN 'sql_exact' ELSE 'sql_near_miss' END\n  FROM pairs\n  ON CONFLICT (user_id, product_id) DO UPDATE SET\n    batch_id = EXCLUDED.batch_id, status = EXCLUDED.status, stage = EXCLUDED.stage,\n    llm_reason = NULL, rank = NULL, notified = false, created_at = now()\n  RETURNING status\n)\nSELECT (SELECT count(*) FROM users WHERE upload_batch_id = $1::uuid) AS users_in_batch,\n       (SELECT count(*) FROM loan_products WHERE is_active) AS active_products,\n       (SELECT count(*) FROM users WHERE upload_batch_id = $1::uuid) * (SELECT count(*) FROM loan_products WHERE is_active) AS naive_pairs,\n       count(*) FILTER (WHERE status = 'approved') AS approved_by_sql,\n       count(*) FILTER (WHERE status = 'review')   AS near_miss_for_llm\nFROM ins;",
+        "options": {
+          "queryReplacement": "={{ [ $('Verify Secret').first().json.batch_id ] }}"
+        }
+      },
+      "id": "bbf77217-c22a-4470-9edb-cea336776227",
+      "name": "Stage 1: SQL Pre-filter",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        688,
+        432
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "9jgYKd07RKNCxXpS",
+          "name": "Local Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- STAGE 2: only near-miss pairs (typically a tiny fraction of all pairs) are fetched for LLM judgement.\nSELECT m.match_id, u.monthly_income, u.credit_score, u.employment_status, u.age,\n       p.product_name, p.provider, p.interest_rate, p.min_monthly_income, p.min_credit_score, p.eligibility_text\nFROM matches m\nJOIN users u ON u.user_id = m.user_id\nJOIN loan_products p ON p.product_id = m.product_id\nWHERE m.batch_id = $1::uuid AND m.status = 'review'\nORDER BY m.match_id\nLIMIT 200;",
+        "options": {
+          "queryReplacement": "={{ [ $('Verify Secret').first().json.batch_id ] }}"
+        }
+      },
+      "id": "7f99b3c5-0ae4-49e8-9ffb-22f56f3c8258",
+      "name": "Stage 2: Fetch Near-Misses",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        928,
+        432
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "9jgYKd07RKNCxXpS",
+          "name": "Local Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// STAGE 3 (prep): pack near-miss pairs into batches so ONE LLM call judges many pairs (25 by default).\nconst size = parseInt($env.LLM_BATCH_SIZE || '25', 10);\nconst maxPairs = parseInt($env.LLM_MAX_PAIRS || '200', 10);\nconst rows = $input.all().map(i => i.json).filter(r => r.match_id).slice(0, maxPairs);\nif (!rows.length) return [{ json: { skip: true } }];\nconst out = [];\nfor (let i = 0; i < rows.length; i += size) {\n  const pairs = rows.slice(i, i + size);\n  const payload = pairs.map(p => ({\n    match_id: p.match_id,\n    applicant: { monthly_income: p.monthly_income, credit_score: p.credit_score,\n                 employment_status: p.employment_status, age: p.age },\n    product: { name: p.product_name, interest_rate: p.interest_rate, min_monthly_income: p.min_monthly_income,\n               min_credit_score: p.min_credit_score, notes: p.eligibility_text },\n  }));\n  const prompt = 'You are a careful loan pre-screening assistant. Each item is an applicant who narrowly misses ONE ' +\n    'numeric threshold (income or credit score) of a personal loan product. Mark eligible=true ONLY if the shortfall is ' +\n    'marginal AND the rest of the profile compensates (e.g. stable salaried employment, income well above the minimum, ' +\n    'strong score). Otherwise eligible=false. Return ONLY a JSON array: ' +\n    '[{\"match_id\": number, \"eligible\": boolean, \"reason\": string (max 20 words, addressed to the applicant)}]. ' +\n    'ITEMS: ' + JSON.stringify(payload);\n  out.push({ json: { skip: false, ids: pairs.map(p => p.match_id), prompt } });\n}\nreturn out;"
+      },
+      "id": "3edf9d31-450b-427d-aafe-ca4b8455c324",
+      "name": "Build LLM Batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1168,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "1976a304-248e-4004-8879-6ccf7bda88d1",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e0263879-1c39-427d-b201-31bf3a03c0f2",
+      "name": "Skip LLM? (no near-misses)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1408,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + ($env.GEMINI_MODEL || 'gemini-2.0-flash') + ':generateContent' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-goog-api-key",
+              "value": "={{ $env.GEMINI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [{ text: $json.prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0 } }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "eb8f7384-80d0-4c15-b935-34e8038788dc",
+      "name": "Stage 3: LLM Judge (batched)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1648,
+        336
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn each LLM answer into verdicts. Conservative fallback: if the LLM is unreachable, near misses are rejected.\nconst batches = $('Build LLM Batches').all();\nreturn $input.all().map((item, i) => {\n  const ids = batches[i].json.ids;\n  let verdicts = [];\n  try {\n    const parsed = JSON.parse(item.json.candidates[0].content.parts[0].text);\n    const arr = Array.isArray(parsed) ? parsed : (parsed.results || []);\n    verdicts = arr.filter(v => ids.includes(Number(v.match_id)))\n                  .map(v => ({ match_id: Number(v.match_id), eligible: v.eligible === true,\n                               reason: String(v.reason || '').slice(0, 200) }));\n  } catch (e) { /* fall through to fallback */ }\n  const seen = new Set(verdicts.map(v => v.match_id));\n  for (const id of ids) if (!seen.has(id)) verdicts.push({ match_id: id, eligible: false, reason: 'llm_unavailable' });\n  return { json: { verdicts } };\n});"
+      },
+      "id": "1738978b-e682-4299-9a92-efc04050b53c",
+      "name": "Parse LLM Verdicts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1888,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE matches m\nSET status = CASE WHEN v.eligible THEN 'approved' ELSE 'rejected' END,\n    stage = 'llm_judged', llm_reason = v.reason\nFROM jsonb_to_recordset($1::jsonb) AS v(match_id bigint, eligible boolean, reason text)\nWHERE m.match_id = v.match_id\nRETURNING m.match_id;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.verdicts) ] }}"
+        }
+      },
+      "id": "aa001947-76ad-4eda-bc89-58d8a55824bf",
+      "name": "Apply Verdicts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2128,
+        336
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "9jgYKd07RKNCxXpS",
+          "name": "Local Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- STAGE 4: rank approved matches per user (exact matches first, then lowest interest rate).\nWITH ranked AS (\n  SELECT m.match_id,\n         ROW_NUMBER() OVER (PARTITION BY m.user_id\n                            ORDER BY (m.stage = 'sql_exact') DESC, p.interest_rate ASC) AS rn\n  FROM matches m JOIN loan_products p ON p.product_id = m.product_id\n  WHERE m.batch_id = $1::uuid AND m.status = 'approved'\n), upd AS (\n  UPDATE matches m SET rank = r.rn FROM ranked r WHERE m.match_id = r.match_id RETURNING m.match_id\n)\nSELECT count(*) AS ranked_matches FROM upd;",
+        "options": {
+          "queryReplacement": "={{ [ $('Verify Secret').first().json.batch_id ] }}"
+        }
+      },
+      "id": "c9d8c37f-65a2-4436-9002-94c01cdaadb0",
+      "name": "Stage 4: Rank Matches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2368,
+        432
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "9jgYKd07RKNCxXpS",
+          "name": "Local Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE upload_batches SET status = 'matched', matched_at = now() WHERE batch_id = $1::uuid RETURNING batch_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Verify Secret').first().json.batch_id ] }}"
+        }
+      },
+      "id": "58f1bd08-e9e4-4466-959b-7ec266e9b605",
+      "name": "Set Status: matched",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2608,
+        432
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "9jgYKd07RKNCxXpS",
+          "name": "Local Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5678/webhook/notify-users",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-webhook-secret",
+              "value": "={{ $env.WEBHOOK_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ batch_id: $('Verify Secret').first().json.batch_id }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "99b247c0-7217-422a-97de-cfcf7267da65",
+      "name": "Trigger Workflow C",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2848,
+        432
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "content": "**Workflow B - Multi-stage matching (Optimization Treasure Hunt)**\n\nNaive: users x products pairs -> one LLM call each (slow, costly).\n\nStage 1 SQL pre-filter: hard rules for ALL pairs in one set-based query. Exact matches approved instantly.\nStage 2: only near-misses (<=10% income / <=20 score short) are fetched.\nStage 3: near-misses are BATCHED (25 per LLM call). LLM down -> conservative reject.\nStage 4: rank per user, mark batch matched, trigger workflow C.",
+        "height": 260,
+        "width": 620
+      },
+      "id": "5c16aa02-95d7-4910-95b6-3e8867477c3c",
+      "name": "Note 644",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook: New Batch": {
+      "main": [
+        [
+          {
+            "node": "Verify Secret",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Secret": {
+      "main": [
+        [
+          {
+            "node": "Set Status: matching",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Status: matching": {
+      "main": [
+        [
+          {
+            "node": "Stage 1: SQL Pre-filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 1: SQL Pre-filter": {
+      "main": [
+        [
+          {
+            "node": "Stage 2: Fetch Near-Misses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 2: Fetch Near-Misses": {
+      "main": [
+        [
+          {
+            "node": "Build LLM Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build LLM Batches": {
+      "main": [
+        [
+          {
+            "node": "Skip LLM? (no near-misses)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip LLM? (no near-misses)": {
+      "main": [
+        [
+          {
+            "node": "Stage 4: Rank Matches",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stage 3: LLM Judge (batched)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 3: LLM Judge (batched)": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM Verdicts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse LLM Verdicts": {
+      "main": [
+        [
+          {
+            "node": "Apply Verdicts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Verdicts": {
+      "main": [
+        [
+          {
+            "node": "Stage 4: Rank Matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 4: Rank Matches": {
+      "main": [
+        [
+          {
+            "node": "Set Status: matched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Status: matched": {
+      "main": [
+        [
+          {
+            "node": "Trigger Workflow C",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "85583d33-ae23-43f3-9c07-665d6a56941e",
+  "meta": {
+    "instanceId": "8516b5973ff6dba359deb11ee9cee1dfed7bf21398b36a98d1085d3bd2fc4d76"
+  },
+  "nodeGroups": [],
+  "id": "oTBrLZbN4xjuYqlV",
+  "tags": []
+}

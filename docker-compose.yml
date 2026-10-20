@@ -1,0 +1,88 @@
+name: loan-engine
+
+# Local stack: Postgres (stands in for RDS), LocalStack (S3 + Lambda + API Gateway + SES),
+# self-hosted n8n, the upload UI, and mock lender websites for the crawler.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: loan-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-loan_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-loan_pass_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-loan_engine}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-loan_admin} -d ${POSTGRES_DB:-loan_engine}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  localstack:
+    # Pinned: newer "latest" images may require a LocalStack auth token.
+    image: localstack/localstack:3.8.1
+    container_name: localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,lambda,apigateway,cloudformation,iam,sts,logs,ses,events,ssm
+      # Lambda containers join this network so they can reach "postgres" and "n8n" by name.
+      LAMBDA_DOCKER_NETWORK: loan-net
+      EXTRA_CORS_ALLOWED_ORIGINS: http://localhost:8080
+      DEBUG: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - localstack-data:/var/lib/localstack
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: loan-n8n
+    ports:
+      - "5678:5678"
+    env_file:
+      - .env
+    environment:
+      N8N_HOST: localhost
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: http://localhost:5678/
+      GENERIC_TIMEZONE: Asia/Kolkata
+      TZ: Asia/Kolkata
+      # Workflows read GEMINI_API_KEY, WEBHOOK_SECRET, TEST_EMAIL_ALIASES... via $env
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      N8N_RUNNERS_ENABLED: "true"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n:/import:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ui:
+    image: nginx:alpine
+    container_name: loan-ui
+    ports:
+      - "8080:80"
+    volumes:
+      - ./ui:/usr/share/nginx/html:ro
+
+  mock-sites:
+    # Deterministic "lender websites" for the crawler demo (workflow A).
+    image: nginx:alpine
+    container_name: loan-mock-sites
+    ports:
+      - "8081:80"
+    volumes:
+      - ./mock-sites:/usr/share/nginx/html:ro
+
+volumes:
+  pgdata:
+  localstack-data:
+  n8n_data:
+
+networks:
+  default:
+    name: loan-net

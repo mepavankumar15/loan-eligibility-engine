@@ -1,0 +1,371 @@
+{
+  "name": "A - Loan Product Discovery",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      },
+      "id": "28302b73-aea1-4afe-9c2c-e97180540cb7",
+      "name": "Daily 2AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        272
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "715ae715-5563-4c92-8e1e-57fa1ed1a1cc",
+      "name": "Run Now (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Edit this list to add or remove lender websites. Failures on one site never stop the others.\nconst sources = [\n  { source: 'mock-bank-a', url: 'http://mock-sites/bank-a.html' },   // article cards with data-* attributes\n  { source: 'mock-bank-b', url: 'http://mock-sites/bank-b.html' },   // table rows, same data-* convention\n  { source: 'mock-bank-c', url: 'http://mock-sites/bank-c.html' },   // unstructured prose -> LLM extraction\n  // Optional live site (may block bots; the pipeline tolerates failures):\n  // { source: 'bankbazaar', url: 'https://www.bankbazaar.com/personal-loan.html' },\n];\nreturn sources.map(s => ({ json: s }));"
+      },
+      "id": "aaf2b9fc-3c8d-49b2-8df0-14f4bcd0cb43",
+      "name": "Source List",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "id": "bd23a295-d948-430a-94db-e9046280c09c",
+      "name": "Fetch Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        368
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Layer 1 (free, fast, deterministic): read data-* attributes straight from the HTML.\n// Layer 2 (only if layer 1 finds nothing): pass cleaned page text to the LLM.\nconst sources = $('Source List').all();\nconst out = [];\n$input.all().forEach((item, i) => {\n  const src = sources[i].json;\n  const html = typeof item.json.data === 'string' ? item.json.data : '';\n  if (!html) {\n    out.push({ json: { source: src.source, url: src.url, products: [], needs_llm: false,\n                       error: (item.json.error && item.json.error.message) || 'empty response' } });\n    return;\n  }\n  const products = [];\n  const tags = html.match(/<[^>]*\\sdata-product-name=\"[^\"]*\"[^>]*>/gi) || [];\n  for (const tag of tags) {\n    const a = {};\n    for (const m of tag.matchAll(/data-([a-z-]+)=\"([^\"]*)\"/gi)) a[m[1].toLowerCase()] = m[2];\n    products.push({\n      product_name: a['product-name'], provider: a['provider'] || src.source,\n      interest_rate: a['interest-rate'], min_monthly_income: a['min-income'],\n      min_credit_score: a['min-score'], max_credit_score: a['max-score'],\n      min_age: a['min-age'], max_age: a['max-age'],\n      allowed_employment: a['employment'], eligibility_text: a['notes'] || '',\n    });\n  }\n  const text = html.replace(/<script[\\s\\S]*?<\\/script>/gi, ' ').replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 12000);\n  out.push({ json: { source: src.source, url: src.url, products,\n                     needs_llm: products.length === 0 && text.length > 200, page_text: text } });\n});\nreturn out;"
+      },
+      "id": "9b291020-5ef5-42df-83dd-f95320518e7b",
+      "name": "Parse HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "6cb29b63-e691-4420-99f8-f5b405e7195f",
+              "leftValue": "={{ $json.needs_llm }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b4f86c77-48a7-4cb4-bfb5-e18acad122fb",
+      "name": "Needs LLM?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + ($env.GEMINI_MODEL || 'gemini-2.0-flash') + ':generateContent' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-goog-api-key",
+              "value": "={{ $env.GEMINI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [{ text: 'Extract every PERSONAL LOAN product from this web page text. Return ONLY a JSON array. Each element: {\"product_name\": string, \"provider\": string, \"interest_rate\": number (lowest advertised % p.a.), \"min_monthly_income\": number (INR, 0 if unknown), \"min_credit_score\": number (300 if unknown), \"max_credit_score\": number or null, \"min_age\": number or null, \"max_age\": number or null, \"allowed_employment\": array of strings from [\"salaried\",\"self-employed\"] (empty array if any), \"eligibility_text\": short string}. Do not invent products. PAGE TEXT: ' + $json.page_text }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0 } }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "9577482e-7f62-4a35-8b20-808c9ee26bf2",
+      "name": "Gemini Extract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        272
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge the LLM's JSON answer back with its source. If the LLM is unavailable the source simply yields 0 products.\nconst meta = $('Needs LLM?').all(0);\nreturn $input.all().map((item, i) => {\n  const m = meta[i].json;\n  let products = [], error = null;\n  try {\n    const txt = item.json.candidates[0].content.parts[0].text;\n    const parsed = JSON.parse(txt);\n    products = Array.isArray(parsed) ? parsed : (parsed.products || []);\n  } catch (e) {\n    error = 'LLM extraction unavailable: ' + ((item.json.error && item.json.error.message) || e.message);\n  }\n  return { json: { source: m.source, url: m.url, products, error, via: 'llm' } };\n});"
+      },
+      "id": "b21b04f2-5423-4b5f-a599-1448eaf33c4e",
+      "name": "Parse LLM Products",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate + normalise every product so garbage (from HTML or LLM) never reaches the database.\nconst num = v => {\n  if (v === null || v === undefined || v === '') return null;\n  const n = parseFloat(String(v).replace(/[^0-9.]/g, ''));\n  return Number.isFinite(n) ? n : null;\n};\nconst canon = s => String(s).toLowerCase().replace(/[^a-z]+/g, '-').replace(/^-|-$/g, '');\nconst SYN = { 'selfemployed': 'self-employed', 'self': 'self-employed', 'salary': 'salaried',\n              'employed': 'salaried', 'business': 'self-employed', 'business-owner': 'self-employed' };\nconst emp = v => {\n  const list = Array.isArray(v) ? v : String(v || '').split(',');\n  return list.map(x => canon(x)).filter(Boolean).map(x => SYN[x] || x).join(',');\n};\nreturn $input.all().map(item => {\n  const j = item.json;\n  const good = [];\n  let dropped = 0;\n  for (const p of (j.products || [])) {\n    const rate = num(p.interest_rate);\n    const name = (p.product_name || '').toString().trim();\n    if (!name || rate === null || rate < 1 || rate > 60) { dropped++; continue; }\n    good.push({\n      product_name: name,\n      provider: (p.provider || j.source || '').toString().trim(),\n      interest_rate: rate,\n      min_monthly_income: num(p.min_monthly_income) ?? 0,\n      min_credit_score: Math.min(900, Math.max(300, num(p.min_credit_score) ?? 300)),\n      max_credit_score: num(p.max_credit_score),\n      min_age: num(p.min_age), max_age: num(p.max_age),\n      allowed_employment: emp(p.allowed_employment),\n      eligibility_text: (p.eligibility_text || '').toString().slice(0, 500),\n    });\n  }\n  return { json: { source: j.source, url: j.url, products: good, dropped, error: j.error || null } };\n});"
+      },
+      "id": "da16418b-2693-4b46-96e0-2dd3a96edd13",
+      "name": "Normalize & Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO loan_products\n  (source, product_name, provider, interest_rate, min_monthly_income, min_credit_score, max_credit_score,\n   min_age, max_age, allowed_employment, eligibility_text, source_url, is_active, last_seen_at)\nSELECT $2, x.product_name, x.provider, x.interest_rate, x.min_monthly_income, x.min_credit_score, x.max_credit_score,\n       x.min_age, x.max_age,\n       CASE WHEN COALESCE(x.allowed_employment,'') = '' THEN NULL ELSE string_to_array(x.allowed_employment, ',') END,\n       x.eligibility_text, $3, true, now()\nFROM jsonb_to_recordset($1::jsonb) AS x(product_name text, provider text, interest_rate numeric,\n     min_monthly_income numeric, min_credit_score int, max_credit_score int, min_age int, max_age int,\n     allowed_employment text, eligibility_text text)\nON CONFLICT (source, product_name) DO UPDATE SET\n  provider = EXCLUDED.provider, interest_rate = EXCLUDED.interest_rate,\n  min_monthly_income = EXCLUDED.min_monthly_income, min_credit_score = EXCLUDED.min_credit_score,\n  max_credit_score = EXCLUDED.max_credit_score, min_age = EXCLUDED.min_age, max_age = EXCLUDED.max_age,\n  allowed_employment = EXCLUDED.allowed_employment, eligibility_text = EXCLUDED.eligibility_text,\n  source_url = EXCLUDED.source_url, is_active = true, last_seen_at = now()\nRETURNING product_id;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.products), $json.source, $json.url ] }}"
+        }
+      },
+      "id": "9afbfd62-0d74-4005-8dec-4c8661e0c7fb",
+      "name": "Upsert Products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1920,
+        368
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "9jgYKd07RKNCxXpS",
+          "name": "Local Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE loan_products SET is_active = false WHERE last_seen_at < now() - interval '3 days' RETURNING product_id;",
+        "options": {}
+      },
+      "id": "f6d3a35b-fa29-47c9-9bc5-0093f75cb6a9",
+      "name": "Deactivate Stale Products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2160,
+        368
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "9jgYKd07RKNCxXpS",
+          "name": "Local Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "**Workflow A - Loan product discovery**\n\nSchedule (daily) or manual run.\n1. Fetch each lender page (failures tolerated).\n2. Cheap deterministic parse of data-* attributes.\n3. Only if a page has no structured data -> LLM extraction (cost only where needed).\n4. Validate, upsert into loan_products, deactivate products not seen for 3 days.",
+        "height": 220,
+        "width": 520
+      },
+      "id": "53413717-bd98-4548-9847-7e4553cc3d50",
+      "name": "Note 535",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Daily 2AM": {
+      "main": [
+        [
+          {
+            "node": "Source List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Now (manual)": {
+      "main": [
+        [
+          {
+            "node": "Source List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Source List": {
+      "main": [
+        [
+          {
+            "node": "Fetch Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Page": {
+      "main": [
+        [
+          {
+            "node": "Parse HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse HTML": {
+      "main": [
+        [
+          {
+            "node": "Needs LLM?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs LLM?": {
+      "main": [
+        [
+          {
+            "node": "Gemini Extract",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize & Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Extract": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse LLM Products": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Validate": {
+      "main": [
+        [
+          {
+            "node": "Upsert Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Products": {
+      "main": [
+        [
+          {
+            "node": "Deactivate Stale Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "36752856-d207-43b9-ade2-b3c72a16624d",
+  "meta": {
+    "instanceId": "8516b5973ff6dba359deb11ee9cee1dfed7bf21398b36a98d1085d3bd2fc4d76"
+  },
+  "nodeGroups": [],
+  "id": "COdBL082Tm2DgY4F",
+  "tags": []
+}

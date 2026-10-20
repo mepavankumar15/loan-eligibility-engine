@@ -1,0 +1,270 @@
+{
+  "name": "C - User Notification",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "notify-users",
+        "options": {}
+      },
+      "id": "4c61a2f2-a722-4f4f-837b-5f72d2f25fda",
+      "name": "Webhook: Matching Done",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        368
+      ],
+      "webhookId": "6431bcec-ab62-4350-8ab0-4f2d21d72932"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Security + validation gate: only the Lambda / workflow B (which hold WEBHOOK_SECRET) may trigger this workflow.\nconst secret = $env.WEBHOOK_SECRET;\nconst first = $input.first().json;\nconst got = (first.headers || {})['x-webhook-secret'];\nif (secret && got !== secret) throw new Error('Invalid webhook secret');\nconst batchId = (first.body || {}).batch_id || '';\nif (!/^[0-9a-f-]{36}$/i.test(batchId)) throw new Error('Invalid batch_id');\nreturn [{ json: { batch_id: batchId } }];"
+      },
+      "id": "ff5b4154-946b-4cac-be43-488812910ac6",
+      "name": "Verify Secret",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Top-3 approved, not-yet-notified matches per user in this batch, aggregated into one row per user.\nSELECT u.user_id, u.email,\n       json_agg(json_build_object('name', p.product_name, 'provider', p.provider, 'rate', p.interest_rate,\n                                  'min_income', p.min_monthly_income, 'reason', m.llm_reason)\n                ORDER BY m.rank) AS products,\n       array_agg(m.match_id ORDER BY m.rank) AS match_ids\nFROM matches m\nJOIN users u ON u.user_id = m.user_id\nJOIN loan_products p ON p.product_id = m.product_id\nWHERE m.batch_id = $1::uuid AND m.status = 'approved' AND m.rank <= 3 AND NOT m.notified\nGROUP BY u.user_id, u.email\nORDER BY u.user_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Verify Secret').first().json.batch_id ] }}"
+        }
+      },
+      "id": "9a169b54-c6d3-4826-af74-fa44a5691013",
+      "name": "Fetch Users With New Matches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        448,
+        368
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "9jgYKd07RKNCxXpS",
+          "name": "Local Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// SAFETY: never email addresses from the CSV. Recipients come only from TEST_EMAIL_ALIASES (round-robin).\nconst aliases = ($env.TEST_EMAIL_ALIASES || '').split(',').map(s => s.trim()).filter(Boolean);\nif (!aliases.length) throw new Error('Set TEST_EMAIL_ALIASES in .env - refusing to email CSV addresses.');\nconst max = parseInt($env.DEMO_MAX_EMAILS || '5', 10);\nconst esc = s => String(s ?? '').replace(/[&<>\"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' }[c]));\nreturn $input.all().slice(0, max).map((it, idx) => {\n  const u = it.json;\n  const rows = u.products.map((p, i) =>\n    `<tr><td style=\"padding:8px;border-bottom:1px solid #eee\"><b>${i + 1}. ${esc(p.name)}</b><br>` +\n    `<span style=\"color:#666\">${esc(p.provider)}</span>` +\n    (p.reason && p.reason !== 'llm_unavailable' ? `<br><i style=\"color:#555\">${esc(p.reason)}</i>` : '') + `</td>` +\n    `<td style=\"padding:8px;border-bottom:1px solid #eee;text-align:right\">${esc(p.rate)}% p.a.</td></tr>`).join('');\n  const html = `<div style=\"font-family:Arial,sans-serif;max-width:560px\">` +\n    `<h2>Personal loans you may qualify for</h2>` +\n    `<p>Hi ${esc(u.user_id)}, based on your profile you may be eligible for these personal loans:</p>` +\n    `<table style=\"width:100%;border-collapse:collapse\">${rows}</table>` +\n    `<p style=\"color:#888;font-size:12px\">Indicative eligibility only; final approval is up to the lender. ` +\n    `(Demo email - original CSV address ${esc(u.email.replace(/^(.).*(@.*)$/, '$1***$2'))} was NOT contacted.)</p></div>`;\n  return { json: { to: aliases[idx % aliases.length], user_id: u.user_id,\n                   subject: `${u.products.length} personal loan option(s) you may qualify for`,\n                   html, match_ids: u.match_ids } };\n});"
+      },
+      "id": "1078a2ef-f2b1-49f5-baa8-30865ca03763",
+      "name": "Build Personalized Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "isBodyHtml": true,
+        "subject": "={{ $json.subject }}",
+        "body": "=     {{ $json.html }}",
+        "fromEmail": "={{ $env.SES_FROM_EMAIL }}",
+        "toAddresses": [
+          "={{ [ $json.to ] }}"
+        ],
+        "additionalFields": {}
+      },
+      "id": "849997ae-1880-4b10-bca3-641696825528",
+      "name": "Send Email (AWS SES)",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "position": [
+        1136,
+        176
+      ],
+      "credentials": {
+        "aws": {
+          "id": "4sefQKnn1YXV1hhy",
+          "name": "AWS SES"
+        }
+      },
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE matches SET notified = true WHERE match_id = ANY($1::bigint[]) RETURNING match_id;",
+        "options": {
+          "queryReplacement": "={{ [ '{' + $('Build Personalized Email').item.json.match_ids.join(',') + '}' ] }}"
+        }
+      },
+      "id": "74765596-24d7-4962-ba30-8c5b9798242a",
+      "name": "Mark Matches Notified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1392,
+        368
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "9jgYKd07RKNCxXpS",
+          "name": "Local Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE upload_batches SET status = 'notified', notified_at = now(), emails_sent = (SELECT count(DISTINCT user_id) FROM matches WHERE batch_id = $1::uuid AND notified) WHERE batch_id = $1::uuid RETURNING batch_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Verify Secret').first().json.batch_id ] }}"
+        }
+      },
+      "id": "22a0b5f9-9da0-4df9-949f-661c13adda4d",
+      "name": "Set Status: notified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1632,
+        368
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "9jgYKd07RKNCxXpS",
+          "name": "Local Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "**Workflow C - Notification**\n\nTriggered by workflow B.\n1. One row per user with their top-3 products.\n2. Build HTML email. Recipient = test alias (never the CSV address).\n3. Send via AWS SES node.\n4. Mark matches notified, set batch status = notified.",
+        "height": 200,
+        "width": 520
+      },
+      "id": "790bc6d5-c9ef-40f8-81f5-558ff0c47e0b",
+      "name": "Note 679",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "mepavankumar15@gmail.com",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "html": "={{ $json.html }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1040,
+        368
+      ],
+      "id": "c7d77492-1e2d-417f-9b03-9806c6d0ef10",
+      "name": "Send an Email",
+      "webhookId": "28073ede-cad4-4193-a14c-e240150aaecb",
+      "credentials": {
+        "smtp": {
+          "id": "r6T4NCHtnqvBjW0Y",
+          "name": "GMAIL SMTP"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook: Matching Done": {
+      "main": [
+        [
+          {
+            "node": "Verify Secret",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Secret": {
+      "main": [
+        [
+          {
+            "node": "Fetch Users With New Matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Users With New Matches": {
+      "main": [
+        [
+          {
+            "node": "Build Personalized Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Personalized Email": {
+      "main": [
+        [
+          {
+            "node": "Send an Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email (AWS SES)": {
+      "main": [
+        []
+      ]
+    },
+    "Mark Matches Notified": {
+      "main": [
+        [
+          {
+            "node": "Set Status: notified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an Email": {
+      "main": [
+        [
+          {
+            "node": "Mark Matches Notified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "8690cc08-9d6d-4706-a4e2-ac58a75dd5dc",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "8516b5973ff6dba359deb11ee9cee1dfed7bf21398b36a98d1085d3bd2fc4d76"
+  },
+  "nodeGroups": [],
+  "id": "TAt2xz1U4teIr0nT",
+  "tags": []
+}

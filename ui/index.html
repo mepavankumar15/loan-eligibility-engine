@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loan Eligibility Engine</title>
+<style>
+  :root { --bg:#f6f7fb; --card:#fff; --ink:#1c2333; --muted:#6b7385; --brand:#3b5bdb; --ok:#2b9348; --bad:#d00000; --line:#e3e6ef; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width: 720px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; } .sub { color: var(--muted); margin: 0 0 24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+  #drop { border:2px dashed var(--line); border-radius:12px; padding:36px 16px; text-align:center; cursor:pointer; color:var(--muted); }
+  #drop.over { border-color: var(--brand); background:#eef2ff; }
+  button { background:var(--brand); color:#fff; border:0; border-radius:8px; padding:10px 18px; font-size:1rem; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  input[type=text] { width:100%; padding:8px; border:1px solid var(--line); border-radius:8px; font-family:monospace; }
+  ol.steps { list-style:none; padding:0; margin:0; }
+  ol.steps li { display:flex; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid var(--line); color:var(--muted); }
+  ol.steps li:last-child { border-bottom:0; }
+  ol.steps li .dot { width:14px; height:14px; border-radius:50%; background:var(--line); flex:none; }
+  ol.steps li.active { color:var(--ink); font-weight:600; } ol.steps li.active .dot { background:var(--brand); animation:pulse 1s infinite; }
+  ol.steps li.done { color:var(--ink); } ol.steps li.done .dot { background:var(--ok); }
+  ol.steps li.fail .dot { background:var(--bad); }
+  @keyframes pulse { 50% { opacity:.3; } }
+  table { width:100%; border-collapse:collapse; font-size:.95rem; } td { padding:6px 0; border-bottom:1px solid var(--line); } td:last-child { text-align:right; font-weight:600; }
+  .err { color:var(--bad); font-size:.9rem; } .hint { color:var(--muted); font-size:.85rem; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Loan Eligibility Engine</h1>
+  <p class="sub">Upload a users CSV. It goes straight to S3, is ingested by Lambda, matched and emailed by n8n.</p>
+
+  <div class="card hidden" id="cfgCard">
+    <b>API base URL</b>
+    <p class="hint">Run <code>scripts/post_deploy.sh</code> after deploying (it writes ui/config.js), or paste the URL printed by <code>serverless deploy</code>.</p>
+    <input type="text" id="apiBase" placeholder="http://localhost:4566/restapis/&lt;id&gt;/local/_user_request_">
+  </div>
+
+  <div class="card">
+    <div id="drop">Drop a CSV here or click to choose<br><span class="hint">columns: user_id, email, monthly_income, credit_score, employment_status, age</span></div>
+    <input type="file" id="file" accept=".csv" class="hidden">
+    <p id="fileName" class="hint"></p>
+    <button id="go" disabled>Upload &amp; start pipeline</button>
+    <p id="error" class="err"></p>
+  </div>
+
+  <div class="card hidden" id="progress">
+    <b>Pipeline progress</b> <span class="hint" id="batchLabel"></span>
+    <ol class="steps" id="steps">
+      <li data-s="awaiting_upload"><span class="dot"></span>Uploaded to S3</li>
+      <li data-s="processed"><span class="dot"></span>CSV parsed &amp; stored in Postgres (Lambda)</li>
+      <li data-s="matched"><span class="dot"></span>Users matched to loan products (n8n workflow B)</li>
+      <li data-s="notified"><span class="dot"></span>Emails sent (n8n workflow C)</li>
+    </ol>
+  </div>
+
+  <div class="card hidden" id="stats">
+    <b>Results</b>
+    <table id="statTable"></table>
+    <p class="hint" id="errSample"></p>
+  </div>
+</main>
+
+<script src="config.js" onerror="void 0"></script>
+<script>
+const $ = id => document.getElementById(id);
+const cfg = (window.APP_CONFIG && window.APP_CONFIG.API_BASE) || localStorage.getItem('apiBase') || '';
+let file = null, timer = null;
+
+if (!cfg) $('cfgCard').classList.remove('hidden');
+$('apiBase').value = cfg;
+const apiBase = () => ($('apiBase').value || cfg).replace(/\/$/, '');
+
+function setFile(f) {
+  if (!f) return;
+  file = f; $('fileName').textContent = `${f.name} (${(f.size / 1024).toFixed(1)} KB)`; $('go').disabled = false;
+}
+$('drop').onclick = () => $('file').click();
+$('file').onchange = e => setFile(e.target.files[0]);
+['dragover', 'dragenter'].forEach(ev => $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.remove('over'); }));
+$('drop').addEventListener('drop', e => setFile(e.dataTransfer.files[0]));
+
+$('go').onclick = async () => {
+  $('error').textContent = ''; $('go').disabled = true;
+  try {
+    localStorage.setItem('apiBase', apiBase());
+    // 1) ask our Lambda for a presigned POST
+    const r = await fetch(apiBase() + '/upload-url', { method: 'POST', body: JSON.stringify({ filename: file.name }) });
+    if (!r.ok) throw new Error('upload-url failed: ' + (await r.text()));
+    const { batch_id, url, fields } = await r.json();
+    // 2) upload straight to S3 (the file never passes through Lambda / API Gateway)
+    const fd = new FormData();
+    Object.entries(fields).forEach(([k, v]) => fd.append(k, v));
+    fd.append('file', file);                       // must be the last field
+    const up = await fetch(url, { method: 'POST', body: fd });
+    if (!up.ok) throw new Error('S3 upload failed: ' + up.status + ' ' + (await up.text()));
+    $('progress').classList.remove('hidden'); $('batchLabel').textContent = batch_id;
+    poll(batch_id);
+  } catch (e) { $('error').textContent = e.message; $('go').disabled = false; }
+};
+
+const ORDER = ['awaiting_upload', 'processing', 'processed', 'matching', 'matched', 'notified'];
+function render(b) {
+  const idx = ORDER.indexOf(b.status);
+  const mark = { awaiting_upload: 1, processed: 2, matched: 4, notified: 5 };
+  document.querySelectorAll('#steps li').forEach(li => {
+    const need = mark[li.dataset.s];
+    li.className = b.status === 'failed' || b.status === 'webhook_failed' ? 'fail'
+      : idx >= need ? 'done' : (idx === need - 1 ? 'active' : '');
+  });
+  const rows = [['Status', b.status], ['Rows in file', b.total_rows], ['Valid / invalid', `${b.valid_rows} / ${b.invalid_rows}`]];
+  Object.entries(b.matches || {}).forEach(([k, v]) => rows.push([`Matches: ${k}`, v]));
+  rows.push(['Emails sent', b.emails_sent]);
+  $('stats').classList.remove('hidden');
+  $('statTable').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+  $('errSample').textContent = (b.error_sample || []).length
+    ? 'Sample invalid rows: ' + b.error_sample.slice(0, 3).map(e => `row ${e.row}: ${e.error}`).join('; ') : '';
+}
+function poll(id) {
+  clearInterval(timer);
+  const tick = async () => {
+    try {
+      const r = await fetch(`${apiBase()}/batches/${id}`); if (!r.ok) return;
+      const b = await r.json(); render(b);
+      if (['notified', 'failed', 'webhook_failed'].includes(b.status)) { clearInterval(timer); $('go').disabled = false; }
+    } catch (e) { /* keep polling */ }
+  };
+  tick(); timer = setInterval(tick, 2000);
+}
+</script>
+</body>
+</html>
