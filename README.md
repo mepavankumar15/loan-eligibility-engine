@@ -30,7 +30,7 @@ flowchart LR
     WB["Workflow B<br/>Matching"]
     WC["Workflow C<br/>Notification"]
   end
-  LLM["Gemini API<br/>(free tier)"]
+  LLM["Groq API<br/>(free tier)"]
   SITES["Lender websites"]
   INBOX["Test inbox<br/>abcd+one@gmail.com"]
 
@@ -71,8 +71,8 @@ flowchart LR
 * Node.js 18+ and npm (for the Serverless Framework v3)
 * Python 3 + pip (the `serverless-python-requirements` plugin runs `pip`)
 * AWS CLI (only used to talk to LocalStack, no real AWS account needed for the local demo)
-* A free Gemini API key (optional but recommended): https://aistudio.google.com/apikey
-* A Gmail account for the demo inbox (and an AWS account for real SES sending, see 3.7)
+* A free Groq API key (optional but recommended): https://console.groq.com
+* A Gmail account + App Password for email notifications (see 3.7)
 
 ---
 
@@ -82,7 +82,7 @@ flowchart LR
 ```bash
 cp .env.example .env
 ```
-Edit `.env`: set `GEMINI_API_KEY`, `TEST_EMAIL_ALIASES` (replace `abcd` with your Gmail username), `SES_FROM_EMAIL`, and a random `WEBHOOK_SECRET`.
+Edit `.env`: set `GROQ_API_KEY`, `TEST_EMAIL_ALIASES` (replace `abcd` with your Gmail username), `SES_FROM_EMAIL`, `GMAIL_APP_PASSWORD`, and a random `WEBHOOK_SECRET`.
 
 ### 3.2 Start the stack
 ```bash
@@ -121,18 +121,22 @@ Open workflow **A**, click **Run Now (manual)** (the schedule runs it daily at 0
 ```bash
 docker compose exec postgres psql -U loan_admin -d loan_engine -c "SELECT source, product_name, interest_rate, min_monthly_income, min_credit_score FROM loan_products;"
 ```
-You should see products from `mock-bank-a` and `mock-bank-b` (structured HTML). `mock-bank-c` is unstructured and only yields products if `GEMINI_API_KEY` is set (LLM extraction).
+You should see products from `mock-bank-a` and `mock-bank-b` (structured HTML). `mock-bank-c` is unstructured and only yields products if `GROQ_API_KEY` is set (LLM extraction).
 
 ### 3.6 Run the pipeline
 1. Open http://localhost:8080, drop `data/users_generated.csv` (or the provided `users.csv`) and click **Upload**.
 2. Watch the status steps advance. Check your Gmail inbox.
 3. Scalability test: `python3 scripts/generate_sample_users.py 5000 data/users_large.csv` and upload that.
 
-### 3.7 Email delivery (AWS SES node)
-SES can run in two modes. The n8n **AWS SES** node is used in both.
+### 3.7 Email delivery (Gmail SMTP)
+Workflow C uses a **Gmail SMTP** node (no AWS account needed).
 
-* **Real SES sandbox (recommended for the video: a real email lands in Gmail).** Create a free AWS account, open SES (region us-east-1) and verify the *sender* (`SES_FROM_EMAIL`) and each *recipient alias* in `TEST_EMAIL_ALIASES` (sandbox accounts can only send to verified addresses; Gmail `+` aliases each need verification, click the link in the verification mail). Create an IAM user with `ses:SendEmail` permission and put its keys in the **AWS SES** n8n credential, region = your SES region.
-* **LocalStack SES (no AWS account).** In the n8n AWS credential turn on *Custom Endpoints* and set the SES endpoint to `http://localstack:4566`, keys `test` / `test`. Verify the sender once: `aws --endpoint-url=http://localhost:4566 ses verify-email-identity --email-address abcd@gmail.com`. Sent mails are visible at `http://localhost:4566/_aws/ses` (they are not delivered to Gmail).
+1. Enable 2-Step Verification on your Google account.
+2. Go to **Google Account → Security → App Passwords**, create an app password for "Mail".
+3. In n8n: *Credentials → Add credential → SMTP*, set host `smtp.gmail.com`, port `465`, SSL `true`, username = your Gmail address, password = the 16-character App Password.
+4. Wire this credential into the **Send Email** node in Workflow C.
+
+> The AWS SES node is still present in Workflow C (deactivated) as documentation of the cloud-deployment path.
 
 > Safety: workflow C never emails the addresses in the CSV. Recipients always come from `TEST_EMAIL_ALIASES`, and at most `DEMO_MAX_EMAILS` emails are sent per run.
 
@@ -166,7 +170,7 @@ My funnel:
 |---|---|---|---|
 | 1. SQL pre-filter | Postgres, one set-based statement | Hard rules for all pairs at once: age range, allowed employment, max score. Income / score are checked with a tolerance band (>= 90% of min income, >= min score - 20). Exact matches are **approved immediately**; near misses are marked `review`. | Milliseconds, no LLM |
 | 2. Near-miss fetch | n8n Postgres node | Only `review` pairs are read (capped at 200 per run) | tiny |
-| 3. Batched LLM judge | n8n HTTP node -> Gemini | Near misses are packed **25 per call**; the LLM decides if the shortfall is marginal and the profile compensates, and writes a one-line reason that appears in the email. If the LLM is down, near misses are conservatively rejected. | ~1 call per 25 pairs |
+| 3. Batched LLM judge | n8n HTTP node -> Groq (qwen/qwen3-8b) | Near misses are packed **35 per call**; the LLM decides if the shortfall is marginal and the profile compensates, and writes a one-line reason that appears in the email. If the LLM is down, near misses are conservatively rejected. | ~1 call per 35 pairs |
 | 4. Rank | Postgres | `ROW_NUMBER()` per user (exact matches first, then lowest interest rate); top 3 are emailed | no LLM |
 
 Result: LLM calls scale with *near-miss pairs / 25*, not with *users x products*. The stage-1 node returns `naive_pairs`, `approved_by_sql` and `near_miss_for_llm`, so you can show the reduction in the video (check the node output in the execution view).
@@ -174,7 +178,7 @@ Result: LLM calls scale with *near-miss pairs / 25*, not with *users x products*
 Other choices: matching is scoped to the batch (`upload_batch_id`), writes are upserts (re-running a batch is safe), and the webhook is verified with a shared secret.
 
 ### 4.4 Workflow C - notification
-Triggered by workflow B once ranking is done. One SQL query returns one row per user with their top-3 approved, un-notified products. A Code node builds an HTML email, the **AWS SES node** sends it, then matches are marked `notified` so a re-run never double-sends.
+Triggered by workflow B once ranking is done. One SQL query returns one row per user with their top-3 approved, un-notified products. A Code node builds an HTML email, the **Gmail SMTP node** sends it, then matches are marked `notified` so a re-run never double-sends.
 
 ### 4.5 AWS mapping (local vs cloud)
 | Local | AWS |
