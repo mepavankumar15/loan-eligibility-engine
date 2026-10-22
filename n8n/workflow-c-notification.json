@@ -142,7 +142,7 @@
     },
     {
       "parameters": {
-        "content": "**Workflow C - Notification**\n\nTriggered by workflow B.\n1. One row per user with their top-3 products.\n2. Build HTML email. Recipient = test alias (never the CSV address).\n3. Send via AWS SES node.\n4. Mark matches notified, set batch status = notified.",
+        "content": "**Workflow C - Notification**\n\nTriggered by workflow B.\n1. One row per user with their top-3 products.\n2. Build HTML email. Recipient = test alias (never the CSV address).\n3. Send via AWS SES node or SMTP node.\n4. Mark matches notified, set batch status = notified.",
         "height": 200,
         "width": 520
       },
@@ -259,7 +259,7 @@
     "executionOrder": "v1",
     "binaryMode": "separate"
   },
-  "versionId": "8690cc08-9d6d-4706-a4e2-ac58a75dd5dc",
+  "versionId": "5a6c9543-3d41-4602-8c71-5598b5787eda",
   "meta": {
     "templateCredsSetupCompleted": true,
     "instanceId": "8516b5973ff6dba359deb11ee9cee1dfed7bf21398b36a98d1085d3bd2fc4d76"

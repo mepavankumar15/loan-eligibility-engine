@@ -150,20 +150,26 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + ($env.GEMINI_MODEL || 'gemini-2.0-flash') + ':generateContent' }}",
+        "url": "=https://api.groq.com/openai/v1/chat/completions",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
-              "name": "x-goog-api-key",
-              "value": "={{ $env.GEMINI_API_KEY }}"
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.GROQ_API_KEY }}"
             }
           ]
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [{ text: $json.prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0 } }) }}",
+        "jsonBody": "={{ JSON.stringify({ model: \"qwen/qwen3.8-27b\", messages: [{ role: \"user\", content: $json.prompt }], temperature: 0, max_tokens: 3000 }) }}",
         "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 25000
+            }
+          },
           "timeout": 60000
         }
       },
@@ -172,8 +178,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1648,
-        336
+        1664,
+        224
       ],
       "retryOnFail": true,
       "maxTries": 2,
@@ -458,7 +464,7 @@
     "executionOrder": "v1",
     "binaryMode": "separate"
   },
-  "versionId": "85583d33-ae23-43f3-9c07-665d6a56941e",
+  "versionId": "6c220cc9-0331-41c8-8e0e-ae29227cd3a5",
   "meta": {
     "instanceId": "8516b5973ff6dba359deb11ee9cee1dfed7bf21398b36a98d1085d3bd2fc4d76"
   },

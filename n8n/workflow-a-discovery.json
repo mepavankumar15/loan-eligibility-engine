@@ -117,19 +117,19 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + ($env.GEMINI_MODEL || 'gemini-2.0-flash') + ':generateContent' }}",
+        "url": "=https://api.groq.com/openai/v1/chat/completions",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
-              "name": "x-goog-api-key",
-              "value": "={{ $env.GEMINI_API_KEY }}"
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.GROQ_API_KEY }}"
             }
           ]
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [{ text: 'Extract every PERSONAL LOAN product from this web page text. Return ONLY a JSON array. Each element: {\"product_name\": string, \"provider\": string, \"interest_rate\": number (lowest advertised % p.a.), \"min_monthly_income\": number (INR, 0 if unknown), \"min_credit_score\": number (300 if unknown), \"max_credit_score\": number or null, \"min_age\": number or null, \"max_age\": number or null, \"allowed_employment\": array of strings from [\"salaried\",\"self-employed\"] (empty array if any), \"eligibility_text\": short string}. Do not invent products. PAGE TEXT: ' + $json.page_text }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0 } }) }}",
+        "jsonBody": "=     {{ JSON.stringify({ model: \"qwen/qwen3.8-27b\", messages: [{ role: \"user\", content: \"Extract every PERSONAL LOAN product from this web page text. Return ONLY a JSON object: {\\\"products\\\": [...]}. Each element: {\\\"product_name\\\": string, \\\"provider\\\": string, \\\"interest_rate\\\": number, \\\"min_monthly_income\\\": number, \\\"min_credit_score\\\": number, \\\"max_credit_score\\\": number or null, \\\"min_age\\\": number or null, \\\"max_age\\\": number or null, \\\"allowed_employment\\\": array of [\\\"salaried\\\",\\\"self-employed\\\"], \\\"eligibility_text\\\": string}. PAGE TEXT: \" + $json.page_text }], response_format: { type: \"json_object\" }, temperature: 0 }) }}",
         "options": {
           "timeout": 60000
         }
@@ -149,7 +149,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Merge the LLM's JSON answer back with its source. If the LLM is unavailable the source simply yields 0 products.\nconst meta = $('Needs LLM?').all(0);\nreturn $input.all().map((item, i) => {\n  const m = meta[i].json;\n  let products = [], error = null;\n  try {\n    const txt = item.json.candidates[0].content.parts[0].text;\n    const parsed = JSON.parse(txt);\n    products = Array.isArray(parsed) ? parsed : (parsed.products || []);\n  } catch (e) {\n    error = 'LLM extraction unavailable: ' + ((item.json.error && item.json.error.message) || e.message);\n  }\n  return { json: { source: m.source, url: m.url, products, error, via: 'llm' } };\n});"
+        "jsCode": "// Merge the LLM's JSON answer back with its source. If the LLM is unavailable the source simply yields 0 products.\nconst meta = $('Needs LLM?').all(0);\nreturn $input.all().map((item, i) => {\n  const m = meta[i].json;\n  let products = [], error = null;\n  try {\n    const txt = item.json.choices[0].message.content;\n    const parsed = JSON.parse(txt);\n    products = Array.isArray(parsed) ? parsed : (parsed.products || []);\n  } catch (e) {\n    error = 'LLM extraction unavailable: ' + ((item.json.error && item.json.error.message) || e.message);\n  }\n  return { json: { source: m.source, url: m.url, products, error, via: 'llm' } };\n});"
       },
       "id": "b21b04f2-5423-4b5f-a599-1448eaf33c4e",
       "name": "Parse LLM Products",
@@ -361,7 +361,7 @@
     "executionOrder": "v1",
     "binaryMode": "separate"
   },
-  "versionId": "36752856-d207-43b9-ade2-b3c72a16624d",
+  "versionId": "bab14903-f9e8-4223-ae73-c4c5c7d7e63d",
   "meta": {
     "instanceId": "8516b5973ff6dba359deb11ee9cee1dfed7bf21398b36a98d1085d3bd2fc4d76"
   },
